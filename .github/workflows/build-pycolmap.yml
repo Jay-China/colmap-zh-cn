@@ -1,0 +1,383 @@
+name: PyCOLMAP
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - release/*
+  pull_request:
+    types: [ assigned, opened, synchronize, reopened ]
+  release:
+    types: [ published, edited ]
+
+jobs:
+  build:
+    name: ${{ matrix.config.os }} ${{ matrix.config.arch }} ${{ matrix.config.cudaEnabled && 'CUDA' || '' }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      matrix:
+        config: [
+          {os: ubuntu-24.04, cudaEnabled: false, ccacheMaxSize: 800M},
+          {os: macos-14, arch: arm64, deploymentTarget: 14.0, cudaEnabled: false, ccacheMaxSize: 350M},
+          {os: windows-2025-vs2026, cudaEnabled: false, ccacheMaxSize: 1000M},
+          {os: ubuntu-24.04, cudaEnabled: true, ccacheMaxSize: 850M},
+        ]
+    env:
+      COMPILER_CACHE_DIR: ${{ github.workspace }}/compiler-cache
+      CCACHE_DIR: ${{ github.workspace }}/compiler-cache/ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CACHE_PLATFORM: ${{ matrix.config.os }}-arch_${{ matrix.config.arch || 'x64' }}-cuda_${{ matrix.config.cudaEnabled }}-deployment_${{ matrix.config.deploymentTarget || 'default' }}
+      # cibuildwheel creates a different temporary build directory for every
+      # wheel and run. Do not include that directory in compiler cache keys.
+      CCACHE_NOHASHDIR: "true"
+      # Hosted runner compiler mtimes can change even when their contents do
+      # not, which would otherwise invalidate the cache.
+      CCACHE_COMPILERCHECK: content
+      # Keep enough history for the COLMAP and pycolmap objects without
+      # exhausting the repository-wide GitHub Actions cache quota.
+      CCACHE_MAXSIZE: ${{ matrix.config.ccacheMaxSize }}
+      FETCHCONTENT_CACHE_DIR: ${{ github.workspace }}/fetchcontent-cache
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.config.deploymentTarget }}
+      # For faster builds in PRs, build only two Python versions instead of all:
+      # the oldest supported one, so that version-specific breakage does not
+      # reach main, and cp312, the oldest version supported by the pinned Sphinx
+      # used in the docs job, which reuses this wheel.
+      PULL_REQUEST_CIBW_BUILD: cp3{10,12}-{macosx,manylinux,win}*
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux' && matrix.config.cudaEnabled
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v7
+
+      - name: Restore compiler cache
+        uses: ./.github/actions/compiler-cache
+        id: cache-compiler
+        with:
+          mode: restore
+          path: ${{ env.COMPILER_CACHE_DIR }}
+          key-prefix: pycolmap-compiler
+          key-suffix: ${{ env.CACHE_PLATFORM }}
+
+      - name: Select Python
+        if: github.event_name == 'pull_request' && runner.os != 'Windows'
+        run: |
+          echo "CIBW_BUILD=${PULL_REQUEST_CIBW_BUILD}" >> "$GITHUB_ENV"
+      - name: Select Python
+        if: ${{ github.event_name == 'pull_request' && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          echo "CIBW_BUILD=${env:PULL_REQUEST_CIBW_BUILD}" >> "${env:GITHUB_ENV}"
+
+      - name: Set env (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          VCPKG_TARGET_TRIPLET="arm64-osx-release"
+          echo "VCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}" >> "$GITHUB_ENV"
+
+          VCPKG_INSTALLATION_ROOT="/Users/runner/work/vcpkg"
+          CMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          CMAKE_OSX_ARCHITECTURES=${{ matrix.config.arch }}
+          echo "VCPKG_INSTALLATION_ROOT=${VCPKG_INSTALLATION_ROOT}" >> "$GITHUB_ENV"
+          echo "CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}" >> "$GITHUB_ENV"
+          echo "CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}" >> "$GITHUB_ENV"
+          echo "ARCHFLAGS=-arch ${CMAKE_OSX_ARCHITECTURES}" >> "$GITHUB_ENV"
+
+          # Fix: cibuildhweel cannot interpolate env variables.
+          CONFIG_SETTINGS="cmake.define.CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.VCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.VCPKG_INSTALLED_DIR=${{ github.workspace }}/build/vcpkg_installed"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.pybind11_DIR=${COMPILER_CACHE_DIR}/build-requirements/pybind11/share/cmake/pybind11"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.WERROR_ENABLED=ON"
+          echo "CIBW_CONFIG_SETTINGS_MACOS=${CONFIG_SETTINGS}" >> "$GITHUB_ENV"
+
+          echo "FETCHCONTENT_BASE_DIR=${FETCHCONTENT_CACHE_DIR}" >> "$GITHUB_ENV"
+
+          # vcpkg binary caching
+          # !!!PLEASE!!! be nice and don't use this cache for your own purposes. This is only meant for CI purposes in this repository.
+          VCPKG_BINARY_SOURCES="clear;x-azblob,https://colmap.blob.core.windows.net/github-actions-cache,sp=r&st=2024-12-10T17:29:32Z&se=2030-12-31T01:29:32Z&spr=https&sv=2022-11-02&sr=c&sig=bWydkilTMjRn3LHKTxLgdWrFpV4h%2Finzoe9QCOcPpYQ%3D,read"
+          if [ -n "${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_URL }}" ]; then
+            # The secrets are only accessible in runs triggered from within the target repository and not forks.
+            VCPKG_BINARY_SOURCES="${VCPKG_BINARY_SOURCES};x-azblob,${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_URL }},${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_SAS }},write"
+          fi
+          echo "VCPKG_BINARY_SOURCES=${VCPKG_BINARY_SOURCES}" >> "$GITHUB_ENV"
+
+      - name: Set env (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "${{ env.COMPILER_CACHE_DIR }}/bin" >> "${env:GITHUB_PATH}"
+
+          # The Visual Studio generator ignores CMake compiler launchers. Use
+          # Ninja for wheel builds and persist the MSVC developer environment
+          # that Ninja needs into the following cibuildwheel step.
+          & "./scripts/shell/enter_vs_dev_shell.ps1"
+          echo "PATH=${env:PATH}" >> "${env:GITHUB_ENV}"
+          echo "INCLUDE=${env:INCLUDE}" >> "${env:GITHUB_ENV}"
+          echo "LIB=${env:LIB}" >> "${env:GITHUB_ENV}"
+          echo "LIBPATH=${env:LIBPATH}" >> "${env:GITHUB_ENV}"
+
+          $VCPKG_INSTALLATION_ROOT = "${{ github.workspace }}/vcpkg"
+          echo "VCPKG_INSTALLATION_ROOT=${VCPKG_INSTALLATION_ROOT}" >> "${env:GITHUB_ENV}"
+          $CMAKE_TOOLCHAIN_FILE = "${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          echo "CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}" >> "${env:GITHUB_ENV}"
+          $VCPKG_TARGET_TRIPLET = "x64-windows-release"
+          echo "VCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}" >> "${env:GITHUB_ENV}"
+
+          # Fix: cibuildhweel cannot interpolate env variables.
+          $CMAKE_TOOLCHAIN_FILE = $CMAKE_TOOLCHAIN_FILE.replace('\', '/')
+          $VCPKG_INSTALLED_DIR = "${{ github.workspace }}/build/vcpkg_installed"
+          $VCPKG_INSTALLED_DIR = $VCPKG_INSTALLED_DIR.replace('\', '/')
+          $CONFIG_SETTINGS = "cmake.define.CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+          $CONFIG_SETTINGS = "${CONFIG_SETTINGS} cmake.define.VCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}"
+          $CONFIG_SETTINGS = "${CONFIG_SETTINGS} cmake.define.VCPKG_INSTALLED_DIR=${VCPKG_INSTALLED_DIR}"
+          $PYBIND11_DIR = "${env:COMPILER_CACHE_DIR}/build-requirements/pybind11/share/cmake/pybind11".replace('\', '/')
+          $CONFIG_SETTINGS = "${CONFIG_SETTINGS} cmake.define.pybind11_DIR=${PYBIND11_DIR}"
+          $CONFIG_SETTINGS = "${CONFIG_SETTINGS} cmake.args=-GNinja"
+          echo "CIBW_CONFIG_SETTINGS_WINDOWS=${CONFIG_SETTINGS}" >> "${env:GITHUB_ENV}"
+          $CCACHE_DIR = "${env:CCACHE_DIR}".replace('\', '/')
+          $CCACHE_BASEDIR = "${env:CCACHE_BASEDIR}".replace('\', '/')
+          $CIBW_ENVIRONMENT = "BUILD_CUDA_ENABLED=${{ matrix.config.cudaEnabled }}"
+          $CIBW_ENVIRONMENT = "${CIBW_ENVIRONMENT} CCACHE_DIR=${CCACHE_DIR}"
+          $CIBW_ENVIRONMENT = "${CIBW_ENVIRONMENT} CCACHE_BASEDIR=${CCACHE_BASEDIR}"
+          $CIBW_ENVIRONMENT = "${CIBW_ENVIRONMENT} CCACHE_NOHASHDIR=${env:CCACHE_NOHASHDIR}"
+          $CIBW_ENVIRONMENT = "${CIBW_ENVIRONMENT} CCACHE_COMPILERCHECK=${env:CCACHE_COMPILERCHECK}"
+          $CIBW_ENVIRONMENT = "${CIBW_ENVIRONMENT} CCACHE_MAXSIZE=${env:CCACHE_MAXSIZE}"
+          echo "CIBW_ENVIRONMENT_WINDOWS=${CIBW_ENVIRONMENT}" >> "${env:GITHUB_ENV}"
+          $CIBW_REPAIR_WHEEL_COMMAND = "delvewheel repair -v --add-path ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin -w {dest_dir} {wheel}"
+          echo "CIBW_REPAIR_WHEEL_COMMAND_WINDOWS=${CIBW_REPAIR_WHEEL_COMMAND}" >> "${env:GITHUB_ENV}"
+
+          $FETCHCONTENT_BASE_DIR = "${env:FETCHCONTENT_CACHE_DIR}".replace('\', '/')
+          echo "FETCHCONTENT_BASE_DIR=${FETCHCONTENT_BASE_DIR}" >> "${env:GITHUB_ENV}"
+
+          # vcpkg binary caching
+          # !!!PLEASE!!! be nice and don't use this cache for your own purposes. This is only meant for CI purposes in this repository.
+          $VCPKG_BINARY_SOURCES = "clear;x-azblob,https://colmap.blob.core.windows.net/github-actions-cache,sp=r&st=2024-12-10T17:29:32Z&se=2030-12-31T01:29:32Z&spr=https&sv=2022-11-02&sr=c&sig=bWydkilTMjRn3LHKTxLgdWrFpV4h%2Finzoe9QCOcPpYQ%3D,read"
+          if ("${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_URL }}") {
+            # The secrets are only accessible in runs triggered from within the target repository and not forks.
+            $VCPKG_BINARY_SOURCES += ";x-azblob,${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_URL }},${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_SAS }},write"
+          }
+          echo "VCPKG_BINARY_SOURCES=${VCPKG_BINARY_SOURCES}" >> "${env:GITHUB_ENV}"
+
+      - name: Set env (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          VCPKG_TARGET_TRIPLET="x64-linux-release"
+          echo "VCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}" >> "$GITHUB_ENV"
+
+          VCPKG_INSTALLATION_ROOT="${{ github.workspace }}/vcpkg"
+          CMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          echo "VCPKG_INSTALLATION_ROOT=${VCPKG_INSTALLATION_ROOT}" >> "$GITHUB_ENV"
+          echo "CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}" >> "$GITHUB_ENV"
+
+          # Fix: cibuildhweel cannot interpolate env variables.
+          CONFIG_SETTINGS="cmake.define.CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.VCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.VCPKG_INSTALLED_DIR=/project/build/vcpkg_installed"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.pybind11_DIR=/compiler-cache/build-requirements/pybind11/share/cmake/pybind11"
+          CONFIG_SETTINGS="${CONFIG_SETTINGS} cmake.define.WERROR_ENABLED=ON"
+          echo "CIBW_CONFIG_SETTINGS_LINUX=${CONFIG_SETTINGS}" >> "$GITHUB_ENV"
+
+          # Remap caching paths to the container
+          CONTAINER_COMPILER_CACHE_DIR="/compiler-cache"
+          CONTAINER_FETCHCONTENT_CACHE_DIR="/fetchcontent-cache"
+          CIBW_CONTAINER_ENGINE="docker; create_args: -v ${COMPILER_CACHE_DIR}:${CONTAINER_COMPILER_CACHE_DIR} -v ${FETCHCONTENT_CACHE_DIR}:${CONTAINER_FETCHCONTENT_CACHE_DIR}"
+          echo "CIBW_CONTAINER_ENGINE=${CIBW_CONTAINER_ENGINE}" >> "$GITHUB_ENV"
+          echo "CONTAINER_COMPILER_CACHE_DIR=${CONTAINER_COMPILER_CACHE_DIR}" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${CONTAINER_COMPILER_CACHE_DIR}/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=/project" >> "$GITHUB_ENV"
+          echo "FETCHCONTENT_BASE_DIR=${CONTAINER_FETCHCONTENT_CACHE_DIR}" >> "$GITHUB_ENV"
+
+          # vcpkg binary caching
+          # !!!PLEASE!!! be nice and don't use this cache for your own purposes. This is only meant for CI purposes in this repository.
+          VCPKG_BINARY_SOURCES="clear;x-azblob,https://colmap.blob.core.windows.net/github-actions-cache,sp=r&st=2024-12-10T17:29:32Z&se=2030-12-31T01:29:32Z&spr=https&sv=2022-11-02&sr=c&sig=bWydkilTMjRn3LHKTxLgdWrFpV4h%2Finzoe9QCOcPpYQ%3D,read"
+          if [ -n "${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_URL }}" ]; then
+            # The secrets are only accessible in runs triggered from within the target repository and not forks.
+            VCPKG_BINARY_SOURCES="${VCPKG_BINARY_SOURCES};x-azblob,${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_URL }},${{ secrets.VCPKG_BINARY_CACHE_AZBLOB_SAS }},write"
+          fi
+          echo "VCPKG_BINARY_SOURCES=${VCPKG_BINARY_SOURCES}" >> "$GITHUB_ENV"
+
+          CIBW_ENVIRONMENT_PASS_LINUX="VCPKG_TARGET_TRIPLET VCPKG_INSTALLATION_ROOT CMAKE_TOOLCHAIN_FILE VCPKG_BINARY_SOURCES CONTAINER_COMPILER_CACHE_DIR CCACHE_DIR CCACHE_BASEDIR CCACHE_NOHASHDIR CCACHE_COMPILERCHECK CCACHE_MAXSIZE FETCHCONTENT_BASE_DIR"
+          echo "CIBW_ENVIRONMENT_PASS_LINUX=${CIBW_ENVIRONMENT_PASS_LINUX}" >> "$GITHUB_ENV"
+
+          if [ "${{ matrix.config.cudaEnabled }}" = "true" ]; then
+            CIBW_MANYLINUX_X86_64_IMAGE="pytorch/manylinux2_28-builder:cuda12.9"
+            CIBW_REPAIR_WHEEL_COMMAND="auditwheel repair --exclude libcudart* --exclude libcurand* -w {dest_dir} {wheel}"
+            echo "CIBW_REPAIR_WHEEL_COMMAND=${CIBW_REPAIR_WHEEL_COMMAND}" >> "$GITHUB_ENV"
+            # Edit pyproject.toml to change package name to pycolmap-cuda12 and add CUDA Runtime native Libraries and CURAND native runtime libraries to dependencies
+            pip install tomlkit
+            python python/ci/update_pyproject_toml.py --name "pycolmap-cuda12" --add-deps "cuda-toolkit[cudart,curand]>=12,<13"
+          else
+            CIBW_MANYLINUX_X86_64_IMAGE="quay.io/pypa/manylinux_2_28_x86_64"
+          fi
+
+          echo "CIBW_MANYLINUX_X86_64_IMAGE=${CIBW_MANYLINUX_X86_64_IMAGE}" >> "$GITHUB_ENV"
+
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: ./
+        env:
+          CIBW_ARCHS_MACOS: ${{ matrix.config.arch }}
+          CIBW_ENVIRONMENT:  >
+            BUILD_CUDA_ENABLED=${{ matrix.config.cudaEnabled }}
+
+      - name: Show compiler cache stats (Linux/macOS)
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "${RUNNER_OS}" = "Linux" ] && [ -x "${COMPILER_CACHE_DIR}/bin/ccache" ]; then
+            export CCACHE_DIR="${COMPILER_CACHE_DIR}/ccache"
+            CCACHE="${COMPILER_CACHE_DIR}/bin/ccache"
+          elif command -v ccache >/dev/null 2>&1; then
+            CCACHE=ccache
+          else
+            echo "ccache is unavailable"
+            exit 0
+          fi
+          "${CCACHE}" --cleanup
+          "${CCACHE}" --show-stats --verbose
+
+      - name: Show compiler cache stats (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ccache = "${env:COMPILER_CACHE_DIR}/bin/ccache.exe"
+          if (!(Test-Path -PathType Leaf $ccache)) {
+            Write-Output "ccache is unavailable"
+            exit 0
+          }
+          & $ccache --cleanup
+          & $ccache --show-stats --verbose
+
+      - name: Archive wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: pycolmap-${{ matrix.config.os }}-${{ matrix.config.arch }}${{ matrix.config.cudaEnabled && '-CUDA' || '' }}
+          path: wheelhouse/pycolmap*.whl
+
+      - name: Save compiler cache
+        uses: ./.github/actions/compiler-cache
+        with:
+          mode: save
+          key: ${{ steps.cache-compiler.outputs.key }}
+          path: ${{ env.COMPILER_CACHE_DIR }}
+          cache-hit: ${{ steps.cache-compiler.outputs.cache-hit }}
+          ccache-dir: ${{ env.COMPILER_CACHE_DIR }}/ccache
+
+  pypi-publish:
+    name: Publish wheels to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      # This URL is only for display in the GitHub UI
+      url: https://pypi.org/p/pycolmap
+    permissions:
+      id-token: write
+    # We publish the wheel to pypi when a new tag is pushed,
+    # either by creating a new GitHub release or explicitly with `git tag`
+    if: ${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags') }}
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts/
+      - name: Move wheels
+        run: mkdir ./wheelhouse && mv ./artifacts/**/*.whl ./wheelhouse/
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@v1.14.0
+        with:
+          skip-existing: true
+          packages-dir: ./wheelhouse/
+
+  docs:
+    name: Build and deploy documentation
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7   # conf.py's get_git_revision() needs a git checkout
+
+      # Detect whether docs-relevant files changed (gates the deploy/preview steps).
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docs:
+              - 'doc/**'
+              - 'CHANGELOG.rst'
+              - 'python/**'   # pycolmap bindings feed the autodoc API pages
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # Sphinx 9.1 needs >=3.12; matches the cp312 wheel
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: doc/package-lock.json
+
+      # Wheel from the `build` job (same run) so autodoc introspects a pycolmap
+      # that matches the commit.
+      - uses: actions/download-artifact@v8
+        with:
+          name: pycolmap-ubuntu-24.04-
+          path: wheelhouse
+
+      - name: Install pycolmap + Sphinx deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install wheelhouse/pycolmap-*cp312*manylinux*_x86_64.whl
+          pip install -r doc/requirements.txt
+
+      - name: Install and test viewer
+        run: |
+          npm ci --prefix doc
+          npm run typecheck --prefix doc
+          python doc/tests/camera_models_registry_test.py
+          npm test --prefix doc
+          npx --prefix doc playwright install --with-deps chromium
+          npm run test:browser --prefix doc
+
+      - name: Build docs
+        run: make -C doc html   # -> doc/_build/html
+
+      # PR dry-run: publish the generated HTML as a downloadable artifact
+      # (no deploy) so reviewers can inspect the rendered docs.
+      - name: Upload docs preview artifact
+        if: github.event_name == 'pull_request' && steps.filter.outputs.docs == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-preview
+          path: doc/_build/html
+
+      - name: Deploy to colmap.github.io
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.filter.outputs.docs == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          deploy_key: ${{ secrets.COLMAP_GITHUB_IO_DEPLOY_KEY }}
+          external_repository: colmap/colmap.github.io
+          publish_branch: master
+          publish_dir: ./doc/_build/html
+          keep_files: true
+          commit_message: "Update docs from colmap@${{ github.sha }}"
+          full_commit_message: "Update docs from colmap@${{ github.sha }}"

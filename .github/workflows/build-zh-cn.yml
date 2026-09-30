@@ -1,0 +1,63 @@
+name: Build COLMAP zh-CN (Windows GUI)
+
+# 触发方式：push 自动触发，或在 Actions 页面手动 "Run workflow"
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "**" ]
+
+jobs:
+  build-zh-cn:
+    # windows-2022 是稳定可用的官方 runner。
+    # 若想尝试命中 COLMAP 公共二进制缓存以加速，可改成 windows-2025-vs2026（需你的账号支持该标签）。
+    runs-on: windows-2022
+    env:
+      # COLMAP 官方公共只读二进制缓存（读权限，任何人可用；命中则依赖免编译直接下载）
+      VCPKG_BINARY_SOURCES: "clear;x-azblob,https://colmap.blob.core.windows.net/github-actions-cache,sp=r&st=2024-12-10T17:29:32Z&se=2030-12-31T01:29:32Z&spr=https&sv=2022-11-02&sr=c&sig=bWydkilTMjRn3LHKTxLgdWrFpV4h%2Finzoe9QCOcPpYQ%3D,read"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          ./scripts/shell/enter_vs_dev_shell.ps1
+          cd ${{ github.workspace }}
+          git clone https://github.com/microsoft/vcpkg
+          cd vcpkg
+          ./bootstrap-vcpkg.bat
+
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "4.3.2"
+          ninjaVersion: "1.12.1"
+
+      - name: Configure and build (GUI on, CUDA off)
+        shell: pwsh
+        run: |
+          ./scripts/shell/enter_vs_dev_shell.ps1
+          cd ${{ github.workspace }}
+          ./vcpkg/vcpkg.exe integrate install
+          mkdir -Force build
+          cd build
+          cmake .. `
+            -GNinja `
+            -DCMAKE_MAKE_PROGRAM=ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DTESTS_ENABLED=OFF `
+            -DGUI_ENABLED=ON `
+            -DCUDA_ENABLED=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-release `
+            -DVCPKG_USE_LEGACY_APPLOCAL=ON `
+            -DCMAKE_INSTALL_PREFIX=install
+          ninja
+          ninja install
+
+      - name: Upload Chinese COLMAP build
+        uses: actions/upload-artifact@v4
+        with:
+          name: colmap-4.2.0-zh-CN-windows
+          path: ${{ github.workspace }}/build/install
+          if-no-files-found: warn

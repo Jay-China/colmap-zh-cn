@@ -1,0 +1,266 @@
+// Copyright (c), ETH Zurich and UNC Chapel Hill.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+//     * Redistributions of source code must retain the above copyright
+//       notice, this list of conditions and the following disclaimer.
+//
+//     * Redistributions in binary form must reproduce the above copyright
+//       notice, this list of conditions and the following disclaimer in the
+//       documentation and/or other materials provided with the distribution.
+//
+//     * Neither the name of ETH Zurich and UNC Chapel Hill nor the names of
+//       its contributors may be used to endorse or promote products derived
+//       from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#include "colmap/exe/database.h"
+#include "colmap/exe/feature.h"
+#include "colmap/exe/gui.h"
+#include "colmap/exe/image.h"
+#include "colmap/exe/model.h"
+#if defined(COLMAP_MVS_ENABLED)
+#include "colmap/exe/mvs.h"
+#endif
+#include "colmap/exe/sfm.h"
+#include "colmap/exe/vocab_tree.h"
+#include "colmap/util/cancellation.h"
+#include "colmap/util/oiio_utils.h"
+#include "colmap/util/version.h"
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using command_func_t = std::function<int(int, char**)>;
+
+constexpr bool kSupportsGracefulShutdown = true;
+
+struct Command {
+  Command(std::string name,
+          command_func_t function,
+          const bool supports_graceful_shutdown = false)
+      : name(std::move(name)),
+        function(std::move(function)),
+        supports_graceful_shutdown(supports_graceful_shutdown) {}
+
+  std::string name;
+  command_func_t function;
+  bool supports_graceful_shutdown;
+};
+
+void ShowVersion() {
+  std::cout << colmap::GetVersionInfo() << " (" << colmap::GetBuildInfo()
+            << ")\n";
+}
+
+void ShowHelp(const std::vector<Command>& commands) {
+  ShowVersion();
+
+  std::cout << "Usage:\n";
+  std::cout << "  colmap [command] [options]\n";
+
+  std::cout << "Documentation:\n";
+  std::cout << "  https://colmap.github.io/\n";
+
+  std::cout << "Example usage:\n";
+  std::cout << "  colmap help [ -h, --help ]\n";
+  std::cout << "  colmap gui\n";
+  std::cout << "  colmap gui -h [ --help ]\n";
+  std::cout << "  colmap automatic_reconstructor -h [ --help ]\n";
+  std::cout << "  colmap automatic_reconstructor --image_path IMAGES "
+               "--workspace_path WORKSPACE\n";
+  std::cout << "  colmap feature_extractor --image_path IMAGES --database_path "
+               "DATABASE\n";
+  std::cout << "  colmap exhaustive_matcher --database_path DATABASE\n";
+  std::cout << "  colmap mapper --image_path IMAGES --database_path DATABASE "
+               "--output_path MODEL\n";
+  std::cout << "  ...\n";
+
+  std::cout << "Available commands:\n";
+  std::cout << "  help\n";
+  std::cout << "  version\n";
+  for (const auto& command : commands) {
+    std::cout << "  " << command.name << '\n';
+  }
+  std::cout << '\n';
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  colmap::InitializeGlog(argv);
+  colmap::EnsureOpenImageIOInitialized();
+
+  std::vector<Command> commands;
+  commands.emplace_back("gui", &colmap::RunGraphicalUserInterface);
+  // The automatic reconstructor installs its handler after parsing the mapper
+  // type, since only incremental mapping supports resumable shutdown.
+  commands.emplace_back("automatic_reconstructor",
+                        &colmap::RunAutomaticReconstructor);
+  commands.emplace_back(
+      "bundle_adjuster", &colmap::RunBundleAdjuster, kSupportsGracefulShutdown);
+  commands.emplace_back("color_extractor", &colmap::RunColorExtractor);
+  commands.emplace_back("database_cleaner", &colmap::RunDatabaseCleaner);
+  commands.emplace_back("database_creator", &colmap::RunDatabaseCreator);
+  commands.emplace_back("database_merger", &colmap::RunDatabaseMerger);
+#if defined(COLMAP_MVS_ENABLED)
+  commands.emplace_back("advancing_front_mesher",
+                        &colmap::RunAdvancingFrontMesher);
+  commands.emplace_back("delaunay_mesher", &colmap::RunDelaunayMesher);
+#endif
+  commands.emplace_back("exhaustive_matcher",
+                        &colmap::RunExhaustiveMatcher,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("feature_extractor",
+                        &colmap::RunFeatureExtractor,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("feature_importer",
+                        &colmap::RunFeatureImporter,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("geometric_verifier",
+                        &colmap::RunGeometricVerifier,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("global_mapper", &colmap::RunGlobalMapper);
+  commands.emplace_back("guided_geometric_verifier",
+                        &colmap::RunGuidedGeometricVerifier,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("hierarchical_mapper", &colmap::RunHierarchicalMapper);
+  commands.emplace_back("image_deleter", &colmap::RunImageDeleter);
+  commands.emplace_back("image_filterer", &colmap::RunImageFilterer);
+  commands.emplace_back(
+      "image_rectifier", &colmap::RunImageRectifier, kSupportsGracefulShutdown);
+  commands.emplace_back("image_registrator",
+                        &colmap::RunImageRegistrator,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("image_undistorter",
+                        &colmap::RunImageUndistorter,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("image_undistorter_standalone",
+                        &colmap::RunImageUndistorterStandalone,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back(
+      "mapper", &colmap::RunMapper, kSupportsGracefulShutdown);
+  commands.emplace_back("matches_importer",
+                        &colmap::RunMatchesImporter,
+                        kSupportsGracefulShutdown);
+#if defined(COLMAP_MVS_ENABLED)
+  commands.emplace_back("mesh_simplifier", &colmap::RunMeshSimplifier);
+  commands.emplace_back("mesh_texturer", &colmap::RunMeshTexturer);
+#endif
+  commands.emplace_back("model_aligner", &colmap::RunModelAligner);
+  commands.emplace_back("model_analyzer", &colmap::RunModelAnalyzer);
+  commands.emplace_back("model_clusterer", &colmap::RunModelClusterer);
+  commands.emplace_back("model_comparer", &colmap::RunModelComparer);
+  commands.emplace_back("model_converter", &colmap::RunModelConverter);
+  commands.emplace_back("model_cropper", &colmap::RunModelCropper);
+  commands.emplace_back("model_merger", &colmap::RunModelMerger);
+  commands.emplace_back("model_orientation_aligner",
+                        &colmap::RunModelOrientationAligner);
+  commands.emplace_back("model_splitter", &colmap::RunModelSplitter);
+  commands.emplace_back("model_transformer", &colmap::RunModelTransformer);
+#if defined(COLMAP_MVS_ENABLED)
+  commands.emplace_back("patch_match_stereo",
+                        &colmap::RunPatchMatchStereo,
+                        kSupportsGracefulShutdown);
+#endif
+  commands.emplace_back("point_filtering", &colmap::RunPointFiltering);
+  commands.emplace_back("point_triangulator",
+                        &colmap::RunPointTriangulator,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("pose_prior_mapper",
+                        &colmap::RunPosePriorMapper,
+                        kSupportsGracefulShutdown);
+#if defined(COLMAP_MVS_ENABLED)
+  commands.emplace_back("poisson_mesher", &colmap::RunPoissonMesher);
+#endif
+  commands.emplace_back("project_generator", &colmap::RunProjectGenerator);
+  commands.emplace_back("rig_configurator", &colmap::RunRigConfigurator);
+  commands.emplace_back("rotation_averager", &colmap::RunRotationAverager);
+  commands.emplace_back("sequential_matcher",
+                        &colmap::RunSequentialMatcher,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back(
+      "spatial_matcher", &colmap::RunSpatialMatcher, kSupportsGracefulShutdown);
+#if defined(COLMAP_MVS_ENABLED)
+  commands.emplace_back(
+      "stereo_fusion", &colmap::RunStereoFuser, kSupportsGracefulShutdown);
+#endif
+  commands.emplace_back("transitive_matcher",
+                        &colmap::RunTransitiveMatcher,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("view_graph_calibrator",
+                        &colmap::RunViewGraphCalibrator);
+  commands.emplace_back("vocab_tree_builder", &colmap::RunVocabTreeBuilder);
+  commands.emplace_back("vocab_tree_matcher",
+                        &colmap::RunVocabTreeMatcher,
+                        kSupportsGracefulShutdown);
+  commands.emplace_back("vocab_tree_retriever", &colmap::RunVocabTreeRetriever);
+
+  if (argc == 1) {
+    ShowHelp(commands);
+    return EXIT_SUCCESS;
+  }
+
+  const std::string command = argv[1];
+  if (command == "help" || command == "--help" || command == "-h") {
+    ShowHelp(commands);
+    return EXIT_SUCCESS;
+  } else if (command == "version" || command == "--version" ||
+             command == "-v") {
+    ShowVersion();
+    return EXIT_SUCCESS;
+  } else {
+    const Command* matched_command = nullptr;
+    for (const auto& registered_command : commands) {
+      if (command == registered_command.name) {
+        matched_command = &registered_command;
+        break;
+      }
+    }
+    if (matched_command == nullptr) {
+      LOG(ERROR) << colmap::StringPrintf(
+          "Command `%s` not recognized. To list the "
+          "available commands, run `colmap help`.",
+          command.c_str());
+      return EXIT_FAILURE;
+    } else {
+      int command_argc = argc - 1;
+      char** command_argv = &argv[1];
+      command_argv[0] = argv[0];
+      std::unique_ptr<colmap::ScopedSignalHandler> signal_handler;
+      if (matched_command->supports_graceful_shutdown) {
+        signal_handler = std::make_unique<colmap::ScopedSignalHandler>();
+      }
+
+      const int exit_code =
+          matched_command->function(command_argc, command_argv);
+      if (signal_handler && signal_handler->ReceivedSignal() != 0) {
+        LOG(INFO) << "Graceful shutdown completed after receiving signal "
+                  << signal_handler->ReceivedSignal();
+        return signal_handler->GetExitCode();
+      }
+      return exit_code;
+    }
+  }
+
+  ShowHelp(commands);
+  return EXIT_SUCCESS;
+}

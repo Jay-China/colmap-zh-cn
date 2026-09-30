@@ -1,0 +1,478 @@
+// Copyright (c), ETH Zurich and UNC Chapel Hill.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+//     * Redistributions of source code must retain the above copyright
+//       notice, this list of conditions and the following disclaimer.
+//
+//     * Redistributions in binary form must reproduce the above copyright
+//       notice, this list of conditions and the following disclaimer in the
+//       documentation and/or other materials provided with the distribution.
+//
+//     * Neither the name of ETH Zurich and UNC Chapel Hill nor the names of
+//       its contributors may be used to endorse or promote products derived
+//       from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#include "colmap/image/warp.h"
+
+#include "colmap/math/random.h"
+
+#include <gtest/gtest.h>
+
+namespace colmap {
+namespace {
+namespace {
+
+const Bitmap GenerateRandomBitmap(const int width,
+                                  const int height,
+                                  const bool as_rgb) {
+  Bitmap bitmap(width, height, as_rgb);
+  for (int x = 0; x < width; ++x) {
+    for (int y = 0; y < height; ++y) {
+      BitmapColor<uint8_t> color;
+      color.r = RandomUniformInteger<int>(0, 255);
+      color.g = RandomUniformInteger<int>(0, 255);
+      color.b = RandomUniformInteger<int>(0, 255);
+      bitmap.SetPixel(x, y, color);
+    }
+  }
+  return bitmap;
+}
+
+void CheckBitmapsExactlyEqual(const Bitmap& bitmap1, const Bitmap& bitmap2) {
+  EXPECT_EQ(bitmap1.Width(), bitmap2.Width());
+  EXPECT_EQ(bitmap1.Height(), bitmap2.Height());
+  EXPECT_EQ(bitmap1.IsRGB(), bitmap2.IsRGB());
+  EXPECT_EQ(bitmap1.RowMajorData(), bitmap2.RowMajorData());
+}
+
+WarpImageOptions DirectWarpMinScaleOptions(const double min_scale) {
+  WarpImageOptions options;
+  options.direct_warp_min_scale = min_scale;
+  return options;
+}
+
+// Check that the two bitmaps are equal, ignoring a 1px boundary.
+void CheckBitmapsEqual(const Bitmap& bitmap1, const Bitmap& bitmap2) {
+  ASSERT_EQ(bitmap1.IsGrey(), bitmap2.IsGrey());
+  ASSERT_EQ(bitmap1.IsRGB(), bitmap2.IsRGB());
+  ASSERT_EQ(bitmap1.Width(), bitmap2.Width());
+  ASSERT_EQ(bitmap1.Height(), bitmap2.Height());
+  for (int x = 1; x < bitmap1.Width() - 1; ++x) {
+    for (int y = 1; y < bitmap1.Height() - 1; ++y) {
+      const auto color1 = bitmap1.GetPixel(x, y);
+      const auto color2 = bitmap2.GetPixel(x, y);
+      ASSERT_TRUE(color1.has_value());
+      ASSERT_TRUE(color2.has_value());
+      EXPECT_EQ(*color1, *color2);
+    }
+  }
+}
+
+// Check that the two bitmaps are equal, ignoring a 1px boundary.
+void CheckBitmapsTransposed(const Bitmap& bitmap1, const Bitmap& bitmap2) {
+  ASSERT_EQ(bitmap1.IsGrey(), bitmap2.IsGrey());
+  ASSERT_EQ(bitmap1.IsRGB(), bitmap2.IsRGB());
+  ASSERT_EQ(bitmap1.Width(), bitmap2.Width());
+  ASSERT_EQ(bitmap1.Height(), bitmap2.Height());
+  for (int x = 1; x < bitmap1.Width() - 1; ++x) {
+    for (int y = 1; y < bitmap1.Height() - 1; ++y) {
+      const auto color1 = bitmap1.GetPixel(x, y);
+      const auto color2 = bitmap2.GetPixel(y, x);
+      ASSERT_TRUE(color1.has_value());
+      ASSERT_TRUE(color2.has_value());
+      EXPECT_EQ(*color1, *color2);
+    }
+  }
+}
+
+}  // namespace
+
+TEST(Warp, IdenticalCameras) {
+  const Camera camera =
+      Camera::CreateFromModelId(1, CameraModelId::kPinhole, 1, 100, 100);
+  const Bitmap source_image_gray = GenerateRandomBitmap(100, 100, false);
+  Bitmap target_image_gray;
+  WarpImageBetweenCameras(WarpImageOptions(),
+                          camera,
+                          camera,
+                          source_image_gray,
+                          &target_image_gray);
+  CheckBitmapsEqual(source_image_gray, target_image_gray);
+  const Bitmap source_image_rgb = GenerateRandomBitmap(100, 100, true);
+  Bitmap target_image_rgb;
+  WarpImageBetweenCameras(
+      WarpImageOptions(), camera, camera, source_image_rgb, &target_image_rgb);
+  CheckBitmapsEqual(source_image_rgb, target_image_rgb);
+}
+
+TEST(Warp, DirectWarpMinScale) {
+  const Camera source_camera =
+      Camera::CreateFromModelId(1, CameraModelId::kPinhole, 100, 100, 100);
+  const Bitmap source_image = GenerateRandomBitmap(100, 100, true);
+
+  Camera target_camera = source_camera;
+  target_camera.Rescale(50, 50);
+  Bitmap default_image;
+  WarpImageBetweenCameras(WarpImageOptions(),
+                          source_camera,
+                          target_camera,
+                          source_image,
+                          &default_image);
+  Bitmap direct_image;
+  WarpImageBetweenCameras(DirectWarpMinScaleOptions(0.0),
+                          source_camera,
+                          target_camera,
+                          source_image,
+                          &direct_image);
+  Bitmap resized_image;
+  WarpImageBetweenCameras(DirectWarpMinScaleOptions(1.0),
+                          source_camera,
+                          target_camera,
+                          source_image,
+                          &resized_image);
+  CheckBitmapsExactlyEqual(default_image, direct_image);
+  EXPECT_NE(default_image.RowMajorData(), resized_image.RowMajorData());
+
+  target_camera = source_camera;
+  target_camera.Rescale(49, 49);
+  WarpImageBetweenCameras(WarpImageOptions(),
+                          source_camera,
+                          target_camera,
+                          source_image,
+                          &default_image);
+  WarpImageBetweenCameras(DirectWarpMinScaleOptions(1.0),
+                          source_camera,
+                          target_camera,
+                          source_image,
+                          &resized_image);
+  CheckBitmapsExactlyEqual(default_image, resized_image);
+
+  target_camera = source_camera;
+  target_camera.Rescale(95, 49);
+  WarpImageBetweenCameras(WarpImageOptions(),
+                          source_camera,
+                          target_camera,
+                          source_image,
+                          &default_image);
+  WarpImageBetweenCameras(DirectWarpMinScaleOptions(1.0),
+                          source_camera,
+                          target_camera,
+                          source_image,
+                          &resized_image);
+  CheckBitmapsExactlyEqual(default_image, resized_image);
+
+  EXPECT_ANY_THROW(WarpImageBetweenCameras(DirectWarpMinScaleOptions(-0.1),
+                                           source_camera,
+                                           target_camera,
+                                           source_image,
+                                           &default_image));
+}
+
+TEST(Warp, Interpolation) {
+  const Camera source_camera =
+      Camera::CreateFromModelId(1, CameraModelId::kPinhole, 4, 4, 4);
+  Camera target_camera = source_camera;
+  target_camera.SetPrincipalPointX(1.5);
+
+  Bitmap source_image(4, 4, /*as_rgb=*/false);
+  for (int y = 0; y < source_image.Height(); ++y) {
+    source_image.SetPixel(0, y, BitmapColor<uint8_t>(0));
+    source_image.SetPixel(1, y, BitmapColor<uint8_t>(100));
+  }
+
+  WarpImageOptions options;
+  Bitmap bilinear_image;
+  WarpImageBetweenCameras(
+      options, source_camera, target_camera, source_image, &bilinear_image);
+  ASSERT_TRUE(bilinear_image.GetPixel(0, 0).has_value());
+  EXPECT_EQ(bilinear_image.GetPixel(0, 0)->r, 50);
+
+  options.interpolation = WarpImageOptions::Interpolation::kNearestNeighbor;
+  Bitmap nearest_image;
+  WarpImageBetweenCameras(
+      options, source_camera, target_camera, source_image, &nearest_image);
+  ASSERT_TRUE(nearest_image.GetPixel(0, 0).has_value());
+  EXPECT_EQ(nearest_image.GetPixel(0, 0)->r, 100);
+
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  options.interpolation = static_cast<WarpImageOptions::Interpolation>(-1);
+  EXPECT_ANY_THROW(WarpImageBetweenCameras(
+      options, source_camera, target_camera, source_image, &nearest_image));
+}
+
+TEST(Warp, ShiftedCameras) {
+  const Camera source_camera =
+      Camera::CreateFromModelId(1, CameraModelId::kPinhole, 1, 100, 100);
+  Camera target_camera = source_camera;
+  target_camera.SetPrincipalPointX(0.0);
+  const Bitmap source_image_gray = GenerateRandomBitmap(100, 100, true);
+  Bitmap target_image_gray;
+  WarpImageBetweenCameras(WarpImageOptions(),
+                          source_camera,
+                          target_camera,
+                          source_image_gray,
+                          &target_image_gray);
+  for (int x = 0; x < target_image_gray.Width(); ++x) {
+    for (int y = 0; y < target_image_gray.Height(); ++y) {
+      const auto color = target_image_gray.GetPixel(x, y);
+      ASSERT_TRUE(color.has_value());
+      if (x >= 50) {
+        EXPECT_EQ(*color, BitmapColor<uint8_t>(0));
+      } else {
+        const auto source_color = source_image_gray.GetPixel(x + 50, y);
+        if (source_color && *color != BitmapColor<uint8_t>(0)) {
+          EXPECT_EQ(*color, *source_color);
+        }
+      }
+    }
+  }
+}
+
+TEST(Warp, WarpImageWithHomographyIdentity) {
+  const Bitmap source_image_gray = GenerateRandomBitmap(100, 100, false);
+  Bitmap target_image_gray(100, 100, false);
+  WarpImageWithHomography(
+      Eigen::Matrix3d::Identity(), source_image_gray, &target_image_gray);
+  CheckBitmapsEqual(source_image_gray, target_image_gray);
+
+  const Bitmap source_image_rgb = GenerateRandomBitmap(100, 100, true);
+  Bitmap target_image_rgb(100, 100, true);
+  WarpImageWithHomography(
+      Eigen::Matrix3d::Identity(), source_image_rgb, &target_image_rgb);
+  CheckBitmapsEqual(source_image_rgb, target_image_rgb);
+}
+
+TEST(Warp, WarpImageWithHomographyTransposed) {
+  Eigen::Matrix3d H;
+  H << 0, 1, 0, 1, 0, 0, 0, 0, 1;
+
+  const Bitmap source_image_gray = GenerateRandomBitmap(100, 100, false);
+  Bitmap target_image_gray(100, 100, false);
+  WarpImageWithHomography(H, source_image_gray, &target_image_gray);
+  CheckBitmapsTransposed(source_image_gray, target_image_gray);
+
+  const Bitmap source_image_rgb = GenerateRandomBitmap(100, 100, true);
+  Bitmap target_image_rgb(100, 100, true);
+  WarpImageWithHomography(H, source_image_rgb, &target_image_rgb);
+  CheckBitmapsTransposed(source_image_rgb, target_image_rgb);
+}
+
+TEST(Warp, WarpImageWithHomographyBetweenCamerasIdentity) {
+  const Camera camera =
+      Camera::CreateFromModelId(1, CameraModelId::kPinhole, 1, 100, 100);
+  const Bitmap source_image_gray = GenerateRandomBitmap(100, 100, false);
+  Bitmap target_image_gray;
+  WarpImageWithHomographyBetweenCameras(WarpImageOptions(),
+                                        Eigen::Matrix3d::Identity(),
+                                        camera,
+                                        camera,
+                                        source_image_gray,
+                                        &target_image_gray);
+  CheckBitmapsEqual(source_image_gray, target_image_gray);
+
+  const Bitmap source_image_rgb = GenerateRandomBitmap(100, 100, true);
+  Bitmap target_image_rgb;
+  WarpImageWithHomographyBetweenCameras(WarpImageOptions(),
+                                        Eigen::Matrix3d::Identity(),
+                                        camera,
+                                        camera,
+                                        source_image_rgb,
+                                        &target_image_rgb);
+  CheckBitmapsEqual(source_image_rgb, target_image_rgb);
+}
+
+TEST(Warp, HomographyDirectWarpMinScale) {
+  const Camera source_camera =
+      Camera::CreateFromModelId(1, CameraModelId::kPinhole, 100, 100, 100);
+  const Bitmap source_image = GenerateRandomBitmap(100, 100, false);
+
+  Camera target_camera = source_camera;
+  target_camera.Rescale(50, 50);
+  Bitmap default_image;
+  WarpImageWithHomographyBetweenCameras(WarpImageOptions(),
+                                        Eigen::Matrix3d::Identity(),
+                                        source_camera,
+                                        target_camera,
+                                        source_image,
+                                        &default_image);
+  Bitmap direct_image;
+  WarpImageWithHomographyBetweenCameras(DirectWarpMinScaleOptions(0.0),
+                                        Eigen::Matrix3d::Identity(),
+                                        source_camera,
+                                        target_camera,
+                                        source_image,
+                                        &direct_image);
+  Bitmap resized_image;
+  WarpImageWithHomographyBetweenCameras(DirectWarpMinScaleOptions(1.0),
+                                        Eigen::Matrix3d::Identity(),
+                                        source_camera,
+                                        target_camera,
+                                        source_image,
+                                        &resized_image);
+  CheckBitmapsExactlyEqual(default_image, direct_image);
+  EXPECT_NE(default_image.RowMajorData(), resized_image.RowMajorData());
+
+  target_camera = source_camera;
+  target_camera.Rescale(49, 49);
+  WarpImageWithHomographyBetweenCameras(WarpImageOptions(),
+                                        Eigen::Matrix3d::Identity(),
+                                        source_camera,
+                                        target_camera,
+                                        source_image,
+                                        &default_image);
+  WarpImageWithHomographyBetweenCameras(DirectWarpMinScaleOptions(1.0),
+                                        Eigen::Matrix3d::Identity(),
+                                        source_camera,
+                                        target_camera,
+                                        source_image,
+                                        &resized_image);
+  CheckBitmapsExactlyEqual(default_image, resized_image);
+
+  EXPECT_ANY_THROW(
+      WarpImageWithHomographyBetweenCameras(DirectWarpMinScaleOptions(-0.1),
+                                            Eigen::Matrix3d::Identity(),
+                                            source_camera,
+                                            target_camera,
+                                            source_image,
+                                            &default_image));
+}
+
+TEST(Warp, HomographyInterpolation) {
+  const Camera source_camera =
+      Camera::CreateFromModelId(1, CameraModelId::kPinhole, 4, 4, 4);
+  Camera target_camera = source_camera;
+  target_camera.SetPrincipalPointX(1.5);
+
+  Bitmap source_image(4, 4, /*as_rgb=*/false);
+  for (int y = 0; y < source_image.Height(); ++y) {
+    source_image.SetPixel(0, y, BitmapColor<uint8_t>(0));
+    source_image.SetPixel(1, y, BitmapColor<uint8_t>(100));
+  }
+
+  WarpImageOptions options;
+  Bitmap bilinear_image;
+  WarpImageWithHomographyBetweenCameras(options,
+                                        Eigen::Matrix3d::Identity(),
+                                        source_camera,
+                                        target_camera,
+                                        source_image,
+                                        &bilinear_image);
+  ASSERT_TRUE(bilinear_image.GetPixel(0, 0).has_value());
+  EXPECT_EQ(bilinear_image.GetPixel(0, 0)->r, 50);
+
+  options.interpolation = WarpImageOptions::Interpolation::kNearestNeighbor;
+  Bitmap nearest_image;
+  WarpImageWithHomographyBetweenCameras(options,
+                                        Eigen::Matrix3d::Identity(),
+                                        source_camera,
+                                        target_camera,
+                                        source_image,
+                                        &nearest_image);
+  ASSERT_TRUE(nearest_image.GetPixel(0, 0).has_value());
+  EXPECT_EQ(nearest_image.GetPixel(0, 0)->r, 100);
+
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  options.interpolation = static_cast<WarpImageOptions::Interpolation>(-1);
+  EXPECT_ANY_THROW(
+      WarpImageWithHomographyBetweenCameras(options,
+                                            Eigen::Matrix3d::Identity(),
+                                            source_camera,
+                                            target_camera,
+                                            source_image,
+                                            &nearest_image));
+}
+
+TEST(Warp, WarpImageWithHomographyBetweenCamerasTransposed) {
+  const Camera camera =
+      Camera::CreateFromModelId(1, CameraModelId::kPinhole, 1, 100, 100);
+
+  Eigen::Matrix3d H;
+  H << 0, 1, 0, 1, 0, 0, 0, 0, 1;
+
+  const Bitmap source_image_gray = GenerateRandomBitmap(100, 100, false);
+  Bitmap target_image_gray;
+  WarpImageWithHomographyBetweenCameras(WarpImageOptions(),
+                                        H,
+                                        camera,
+                                        camera,
+                                        source_image_gray,
+                                        &target_image_gray);
+  CheckBitmapsTransposed(source_image_gray, target_image_gray);
+
+  const Bitmap source_image_rgb = GenerateRandomBitmap(100, 100, true);
+  Bitmap target_image_rgb;
+  WarpImageWithHomographyBetweenCameras(WarpImageOptions(),
+                                        H,
+                                        camera,
+                                        camera,
+                                        source_image_rgb,
+                                        &target_image_rgb);
+  CheckBitmapsTransposed(source_image_rgb, target_image_rgb);
+}
+
+TEST(Warp, ResampleImageBilinear) {
+  std::vector<float> image(16);
+  for (size_t i = 0; i < image.size(); ++i) {
+    image[i] = i;
+  }
+
+  std::vector<float> resampled(4);
+  ResampleImageBilinear(image.data(), 4, 4, 2, 2, resampled.data());
+
+  EXPECT_EQ(resampled[0], 2.5);
+  EXPECT_EQ(resampled[1], 4.5);
+  EXPECT_EQ(resampled[2], 10.5);
+  EXPECT_EQ(resampled[3], 12.5);
+}
+
+TEST(Warp, SmoothImage) {
+  std::vector<float> image(16);
+  for (size_t i = 0; i < image.size(); ++i) {
+    image[i] = i;
+  }
+
+  std::vector<float> smoothed(16);
+  SmoothImage(image.data(), 4, 4, 1, 1, smoothed.data());
+
+  EXPECT_NEAR(smoothed[0], 1.81673253, 1e-3);
+  EXPECT_NEAR(smoothed[1], 2.51182437, 1e-3);
+  EXPECT_NEAR(smoothed[2], 3.39494729, 1e-3);
+  EXPECT_NEAR(smoothed[3], 4.09003973, 1e-3);
+  EXPECT_NEAR(smoothed[4], 4.59710073, 1e-3);
+  EXPECT_NEAR(smoothed[5], 5.29219341, 1e-3);
+  EXPECT_NEAR(smoothed[6], 6.17531633, 1e-3);
+  EXPECT_NEAR(smoothed[7], 6.87040806, 1e-3);
+}
+
+TEST(Warp, DownsampleImage) {
+  std::vector<float> image(16);
+  for (size_t i = 0; i < image.size(); ++i) {
+    image[i] = i;
+  }
+
+  std::vector<float> downsampled(4);
+  DownsampleImage(image.data(), 4, 4, 2, 2, downsampled.data());
+
+  EXPECT_NEAR(downsampled[0], 2.76810598, 1e-3);
+  EXPECT_NEAR(downsampled[1], 4.66086388, 1e-3);
+  EXPECT_NEAR(downsampled[2], 10.3391361, 1e-3);
+  EXPECT_NEAR(downsampled[3], 12.2318935, 1e-3);
+}
+
+}  // namespace
+}  // namespace colmap

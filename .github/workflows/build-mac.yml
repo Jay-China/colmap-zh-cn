@@ -1,0 +1,116 @@
+name: COLMAP (Mac)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  push:
+    branches:
+      - main
+      - release/*
+  pull_request:
+    types: [ assigned, opened, synchronize, reopened ]
+  release:
+    types: [ published, edited ]
+
+jobs:
+  build:
+    name: ${{ matrix.config.os }} ${{ matrix.config.arch }} ${{ matrix.config.cmakeBuildType }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      matrix:
+        config: [
+          {
+            os: macos-15,
+            arch: arm64,
+            cmakeBuildType: Release,
+          },
+        ]
+
+    env:
+      COMPILER_CACHE_DIR: ${{ github.workspace }}/compiler-cache
+      CCACHE_DIR: ${{ github.workspace }}/compiler-cache/ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 100M
+      GLOG_v: 2
+      GLOG_logtostderr: 1
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore compiler cache
+        uses: ./.github/actions/compiler-cache
+        id: cache-compiler
+        with:
+          mode: restore
+          path: ${{ env.COMPILER_CACHE_DIR }}
+          key-suffix: ${{ matrix.config.os }}-${{ matrix.config.arch }}-${{ matrix.config.cmakeBuildType }}
+
+      - name: Setup Mac
+        run: |
+          brew install \
+            cmake \
+            ninja \
+            boost \
+            eigen \
+            openimageio \
+            curl \
+            metis \
+            glog \
+            googletest \
+            ceres-solver \
+            qt \
+            glew \
+            cgal \
+            sqlite3 \
+            ccache \
+            libomp
+          brew link --force libomp
+          ccache --zero-stats
+
+      - name: Configure and build
+        run: |
+          export PATH="/usr/local/opt/qt/bin:$PATH"
+          cmake --version
+          mkdir -p build
+          cd build
+          cmake .. \
+            -GNinja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.config.cmakeBuildType }} \
+            -DTESTS_ENABLED=ON \
+            -DWERROR_ENABLED=ON \
+            -DQt6_DIR="$(brew --prefix qt)/lib/cmake/Qt6"
+          ninja
+
+      - name: Run tests
+        run: |
+          cd build
+          set +e
+          ctest --output-on-failure
+
+      - name: Export package
+        run: |
+          ./scripts/shell/build_mac_app.sh build/src/colmap/exe/colmap
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: colmap-arm64-macos
+          path: build/src/colmap/exe/COLMAP-mac.zip
+
+      - name: Cleanup compiler cache
+        run: |
+          set -x
+          ccache --cleanup
+          ccache --show-stats --verbose
+
+      - name: Save compiler cache
+        uses: ./.github/actions/compiler-cache
+        with:
+          mode: save
+          key: ${{ steps.cache-compiler.outputs.key }}
+          path: ${{ env.COMPILER_CACHE_DIR }}
+          cache-hit: ${{ steps.cache-compiler.outputs.cache-hit }}

@@ -1,0 +1,279 @@
+#include "colmap/exe/sfm.h"
+
+#include "colmap/controllers/bundle_adjustment.h"
+#include "colmap/controllers/hierarchical_pipeline.h"
+#include "colmap/controllers/incremental_pipeline.h"
+#include "colmap/estimators/view_graph_calibration.h"
+#include "colmap/scene/database.h"
+#include "colmap/scene/reconstruction.h"
+#include "colmap/scene/reconstruction_manager.h"
+#include "colmap/util/file.h"
+#include "colmap/util/misc.h"
+
+#include "pycolmap/helpers.h"
+#include "pycolmap/pybind11_extension.h"
+
+#include <filesystem>
+#include <memory>
+
+#include <pybind11/functional.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+using namespace colmap;
+using namespace pybind11::literals;
+namespace py = pybind11;
+
+namespace {
+
+std::map<size_t, std::shared_ptr<Reconstruction>> ReconstructionManagerToMap(
+    const std::shared_ptr<ReconstructionManager>& reconstruction_manager) {
+  std::map<size_t, std::shared_ptr<Reconstruction>> reconstructions;
+  for (size_t i = 0; i < reconstruction_manager->Size(); ++i) {
+    reconstructions[i] = reconstruction_manager->Get(i);
+  }
+  return reconstructions;
+}
+
+}  // namespace
+
+std::shared_ptr<Reconstruction> TriangulatePoints(
+    const std::shared_ptr<Reconstruction>& reconstruction,
+    const std::filesystem::path& database_path,
+    const std::filesystem::path& image_path,
+    const std::filesystem::path& output_path,
+    const bool clear_points,
+    const IncrementalPipelineOptions& options,
+    const bool refine_intrinsics,
+    const std::shared_ptr<CancellationToken>& cancellation_token) {
+  THROW_CHECK_FILE_EXISTS(database_path);
+  THROW_CHECK_DIR_EXISTS(image_path);
+  CreateDirIfNotExists(output_path);
+
+  py::gil_scoped_release release;
+  PyInterruptChecker interrupt_checker(cancellation_token);
+  RunPointTriangulatorImpl(reconstruction,
+                           database_path,
+                           image_path,
+                           output_path,
+                           options,
+                           clear_points,
+                           refine_intrinsics,
+                           interrupt_checker.Callback());
+  interrupt_checker.CheckAndThrow();
+  return reconstruction;
+}
+
+std::map<size_t, std::shared_ptr<Reconstruction>> IncrementalMapping(
+    const std::filesystem::path& database_path,
+    const std::filesystem::path& image_path,
+    const std::filesystem::path& output_path,
+    const IncrementalPipelineOptions& options,
+    const std::filesystem::path& input_path,
+    std::function<void()> initial_image_pair_callback,
+    std::function<void()> next_image_callback,
+    const std::shared_ptr<CancellationToken>& cancellation_token) {
+  THROW_CHECK_FILE_EXISTS(database_path);
+  THROW_CHECK_DIR_EXISTS(image_path);
+  CreateDirIfNotExists(output_path);
+
+  py::gil_scoped_release release;
+  auto reconstruction_manager = std::make_shared<ReconstructionManager>();
+  if (input_path != "") {
+    reconstruction_manager->Read(input_path);
+  }
+  auto options_ = std::make_shared<IncrementalPipelineOptions>(options);
+
+  PyInterruptChecker interrupt_checker(cancellation_token);
+  auto next_image_callback_py_interruptible =
+      [next_image_callback = std::move(next_image_callback)]() {
+        if (next_image_callback) {
+          next_image_callback();
+        }
+      };
+
+  const bool success =
+      RunIncrementalMapperImpl(database_path,
+                               image_path,
+                               output_path,
+                               options_,
+                               reconstruction_manager,
+                               initial_image_pair_callback,
+                               next_image_callback_py_interruptible,
+                               interrupt_checker.Callback());
+
+  interrupt_checker.CheckAndThrow();
+  if (!success) {
+    return {};
+  }
+
+  return ReconstructionManagerToMap(reconstruction_manager);
+}
+
+std::map<size_t, std::shared_ptr<Reconstruction>> GlobalMapping(
+    const std::filesystem::path& database_path,
+    const std::filesystem::path& image_path,
+    const std::filesystem::path& output_path,
+    GlobalPipelineOptions options) {
+  THROW_CHECK_FILE_EXISTS(database_path);
+  THROW_CHECK_DIR_EXISTS(image_path);
+  CreateDirIfNotExists(output_path);
+
+  py::gil_scoped_release release;
+  auto reconstruction_manager = std::make_shared<ReconstructionManager>();
+  auto options_ = std::make_shared<GlobalPipelineOptions>(std::move(options));
+  if (!RunGlobalMapperImpl(database_path,
+                           image_path,
+                           output_path,
+                           options_,
+                           reconstruction_manager)) {
+    return {};
+  }
+
+  return ReconstructionManagerToMap(reconstruction_manager);
+}
+
+std::map<size_t, std::shared_ptr<Reconstruction>> HierarchicalMapping(
+    const std::filesystem::path& database_path,
+    const std::filesystem::path& image_path,
+    const std::filesystem::path& output_path,
+    HierarchicalPipelineOptions options) {
+  THROW_CHECK_FILE_EXISTS(database_path);
+  THROW_CHECK_DIR_EXISTS(image_path);
+  CreateDirIfNotExists(output_path);
+
+  py::gil_scoped_release release;
+  auto reconstruction_manager = std::make_shared<ReconstructionManager>();
+  auto options_ =
+      std::make_shared<HierarchicalPipelineOptions>(std::move(options));
+  if (!RunHierarchicalMapperImpl(database_path,
+                                 image_path,
+                                 output_path,
+                                 options_,
+                                 reconstruction_manager)) {
+    return {};
+  }
+
+  return ReconstructionManagerToMap(reconstruction_manager);
+}
+
+void BundleAdjustment(
+    const std::shared_ptr<Reconstruction>& reconstruction,
+    const BundleAdjustmentOptions& options,
+    const std::shared_ptr<CancellationToken>& cancellation_token) {
+  py::gil_scoped_release release;
+  OptionManager option_manager;
+  option_manager.bundle_adjustment =
+      std::make_shared<BundleAdjustmentOptions>(options);
+  PyInterruptChecker interrupt_checker(cancellation_token);
+  BundleAdjustmentController controller(option_manager, reconstruction);
+  controller.SetCheckIfStoppedFunc(interrupt_checker.Callback());
+  controller.Run();
+  interrupt_checker.CheckAndThrow();
+}
+
+bool ViewGraphCalibration(const std::filesystem::path& database_path,
+                          const ViewGraphCalibrationOptions& options) {
+  THROW_CHECK_FILE_EXISTS(database_path);
+  py::gil_scoped_release release;
+  auto database = Database::Open(database_path);
+  return CalibrateViewGraph(options, database.get());
+}
+
+void BindSfM(py::module& m) {
+  // ViewGraphCalibrationOptions
+  {
+    using Opts = ViewGraphCalibrationOptions;
+    auto PyOpts =
+        py::classh<Opts>(m, "ViewGraphCalibrationOptions")
+            .def(py::init<>())
+            .def_readwrite("random_seed", &Opts::random_seed)
+            .def_readwrite("cross_validate_prior_focal_lengths",
+                           &Opts::cross_validate_prior_focal_lengths)
+            .def_readwrite("min_calibrated_pair_ratio",
+                           &Opts::min_calibrated_pair_ratio)
+            .def_readwrite("reestimate_relative_pose",
+                           &Opts::reestimate_relative_pose)
+            .def_readwrite("min_focal_length_ratio",
+                           &Opts::min_focal_length_ratio)
+            .def_readwrite("max_focal_length_ratio",
+                           &Opts::max_focal_length_ratio)
+            .def_readwrite("max_calibration_error",
+                           &Opts::max_calibration_error)
+            .def_readwrite("loss_function_scale", &Opts::loss_function_scale)
+            .def_readwrite("relpose_max_error", &Opts::relpose_max_error)
+            .def_readwrite("relpose_min_num_inliers",
+                           &Opts::relpose_min_num_inliers)
+            .def_readwrite("relpose_min_inlier_ratio",
+                           &Opts::relpose_min_inlier_ratio);
+    MakeDataclass(PyOpts);
+  }
+
+  m.def("triangulate_points",
+        &TriangulatePoints,
+        "reconstruction"_a,
+        "database_path"_a,
+        "image_path"_a,
+        "output_path"_a,
+        "clear_points"_a = true,
+        py::arg_v("options",
+                  IncrementalPipelineOptions(),
+                  "IncrementalPipelineOptions()"),
+        "refine_intrinsics"_a = false,
+        "cancellation_token"_a = py::none(),
+        "Triangulate 3D points from known camera poses");
+
+  m.def("incremental_mapping",
+        &IncrementalMapping,
+        "database_path"_a,
+        "image_path"_a,
+        "output_path"_a,
+        py::arg_v("options",
+                  IncrementalPipelineOptions(),
+                  "IncrementalPipelineOptions()"),
+        "input_path"_a = py::str(""),
+        "initial_image_pair_callback"_a = py::none(),
+        "next_image_callback"_a = py::none(),
+        "cancellation_token"_a = py::none(),
+        "Recover 3D points and unknown camera poses");
+
+  m.def(
+      "global_mapping",
+      &GlobalMapping,
+      "database_path"_a,
+      "image_path"_a,
+      "output_path"_a,
+      py::arg_v("options", GlobalPipelineOptions(), "GlobalPipelineOptions()"),
+      "Recover 3D points and camera poses using global SfM (GLOMAP)");
+
+  m.def("hierarchical_mapping",
+        &HierarchicalMapping,
+        "database_path"_a,
+        "image_path"_a,
+        "output_path"_a,
+        py::arg_v("options",
+                  HierarchicalPipelineOptions(),
+                  "HierarchicalPipelineOptions()"),
+        "Recover 3D points and unknown camera poses by partitioning the scene "
+        "into overlapping clusters, reconstructing them separately using "
+        "incremental mapping, and merging them into a globally consistent "
+        "reconstruction");
+
+  m.def("calibrate_view_graph",
+        &ViewGraphCalibration,
+        "database_path"_a,
+        py::arg_v("options",
+                  ViewGraphCalibrationOptions(),
+                  "ViewGraphCalibrationOptions()"),
+        "Calibrate focal lengths from fundamental matrices and upgrade "
+        "two-view geometries to CALIBRATED in the database. Run before "
+        "global_mapping when reliable intrinsics are unavailable.");
+
+  m.def("bundle_adjustment",
+        &BundleAdjustment,
+        "reconstruction"_a,
+        py::arg_v(
+            "options", BundleAdjustmentOptions(), "BundleAdjustmentOptions()"),
+        "cancellation_token"_a = py::none(),
+        "Jointly refine 3D points and camera poses");
+}

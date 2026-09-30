@@ -1,0 +1,648 @@
+if(COLMAP_FIND_QUIETLY)
+    set(COLMAP_FIND_TYPE QUIET)
+else()
+    set(COLMAP_FIND_TYPE REQUIRED)
+endif()
+
+# Track all the compile definitions
+set(COLMAP_COMPILE_DEFINITIONS)
+if(LSD_ENABLED)
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_LSD_ENABLED)
+    message(STATUS "Enabling LSD support")
+else()
+    message(STATUS "Disabling LSD support")
+endif()
+
+find_package(OpenMP REQUIRED COMPONENTS C CXX)
+
+find_package(Boost ${COLMAP_FIND_TYPE} COMPONENTS
+             graph
+             program_options
+             OPTIONAL_COMPONENTS
+             system)
+
+# Hash map backend selection for the scene/SfM containers. Adds the compile
+# definition consumed by src/colmap/util/hash_containers.h. Both backends are
+# header-only (boost-unordered is provided by the Boost::boost target), so no
+# extra linking is required.
+#
+# BOOST (boost::unordered_flat/node maps) is preferred, but its node maps
+# (boost::unordered_node_map) require Boost >= 1.84. When COLMAP_HASH_MAP_BACKEND
+# is empty we auto-select BOOST if the found Boost is new enough, else STD (so
+# e.g. builds against the system Boost on older distributions keep working).
+#
+# Note: downstream consumers re-run this file via find_package(colmap) with
+# COLMAP_HASH_MAP_BACKEND unset; they get the actual COLMAP_HASH_* macro from the
+# exported colmap targets, so the value re-derived here is only used to keep the
+# selection message and any local sources consistent.
+set(COLMAP_HASH_MAP_BACKEND_MIN_BOOST_VERSION "1.84.0")
+if(DEFINED Boost_VERSION_STRING AND Boost_VERSION_STRING)
+    set(_colmap_boost_version "${Boost_VERSION_STRING}")
+else()
+    set(_colmap_boost_version "${Boost_VERSION}")
+endif()
+string(TOUPPER "${COLMAP_HASH_MAP_BACKEND}" COLMAP_HASH_MAP_BACKEND)
+if(NOT COLMAP_HASH_MAP_BACKEND)
+    if(_colmap_boost_version VERSION_GREATER_EQUAL
+       "${COLMAP_HASH_MAP_BACKEND_MIN_BOOST_VERSION}")
+        set(COLMAP_HASH_MAP_BACKEND "BOOST")
+    else()
+        set(COLMAP_HASH_MAP_BACKEND "STD")
+    endif()
+endif()
+if(COLMAP_HASH_MAP_BACKEND STREQUAL "STD")
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_HASH_STD)
+elseif(COLMAP_HASH_MAP_BACKEND STREQUAL "BOOST")
+    if(_colmap_boost_version VERSION_LESS
+       "${COLMAP_HASH_MAP_BACKEND_MIN_BOOST_VERSION}")
+        message(FATAL_ERROR
+                "COLMAP_HASH_MAP_BACKEND=BOOST requires Boost >= "
+                "${COLMAP_HASH_MAP_BACKEND_MIN_BOOST_VERSION} "
+                "(boost::unordered_node_map), but found Boost "
+                "${_colmap_boost_version}. Upgrade Boost or set "
+                "-DCOLMAP_HASH_MAP_BACKEND=STD.")
+    endif()
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_HASH_BOOST)
+else()
+    message(FATAL_ERROR "Unknown COLMAP_HASH_MAP_BACKEND "
+            "'${COLMAP_HASH_MAP_BACKEND}' (expected STD, BOOST or empty)")
+endif()
+message(STATUS "Using ${COLMAP_HASH_MAP_BACKEND} hash map backend "
+        "(Boost ${_colmap_boost_version})")
+
+find_package(Eigen3 ${COLMAP_FIND_TYPE})
+
+find_package(OpenImageIO ${COLMAP_FIND_TYPE})
+
+find_package(Metis ${COLMAP_FIND_TYPE})
+
+find_package(SQLite3 ${COLMAP_FIND_TYPE})
+# Older CMake versions define SQLite::SQLite3 instead of SQLite3::SQLite3.
+if(NOT TARGET SQLite3::SQLite3 AND TARGET SQLite::SQLite3)
+    add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
+endif()
+
+set(OpenGL_GL_PREFERENCE GLVND)
+find_package(OpenGL ${COLMAP_FIND_TYPE})
+
+find_package(Glew ${COLMAP_FIND_TYPE})
+
+find_package(Git)
+
+find_package(CHOLMOD REQUIRED)
+
+# Ceres and glog expose gflags::gflags in their interface dependencies, but gflags
+# only defines the namespaced target when GFLAGS_USE_TARGET_NAMESPACE is ON. Bridge
+# the gap so consumers can resolve the expected target when only the plain target exists.
+find_package(gflags CONFIG QUIET)
+if(NOT TARGET gflags::gflags AND TARGET gflags)
+    add_library(gflags::gflags ALIAS gflags)
+endif()
+
+# Ceres is found before Glog on purpose. Some distributions (e.g. Fedora) ship a
+# Ceres whose bundled FindGlog.cmake unconditionally calls add_library(glog::glog)
+# in module mode. If we created the glog::glog target first, that call collides
+# with a "target already exists" error (see issue #3347). By finding Ceres first,
+# Ceres creates glog::glog itself, and our subsequent find_package(Glog) reuses
+# the existing target instead.
+find_package(Ceres ${COLMAP_FIND_TYPE})
+if(NOT TARGET Ceres::ceres)
+    # Older Ceres versions don't come with an imported interface target.
+    add_library(Ceres::ceres INTERFACE IMPORTED)
+    target_include_directories(
+        Ceres::ceres INTERFACE ${CERES_INCLUDE_DIRS})
+    target_link_libraries(
+        Ceres::ceres INTERFACE ${CERES_LIBRARIES})
+endif()
+
+find_package(Glog ${COLMAP_FIND_TYPE})
+if(DEFINED glog_VERSION_MAJOR)
+  # Older versions of glog don't export version variables.
+  list(APPEND COLMAP_COMPILE_DEFINITIONS GLOG_VERSION_MAJOR=${glog_VERSION_MAJOR})
+  list(APPEND COLMAP_COMPILE_DEFINITIONS GLOG_VERSION_MINOR=${glog_VERSION_MINOR})
+endif()
+
+if(TESTS_ENABLED)
+    find_package(GTest ${COLMAP_FIND_TYPE})
+endif()
+
+if(HIP_ENABLED)
+    # Locate the ROCm installation. Precedence: an explicit -DROCM_PATH, then the
+    # ROCM_PATH environment variable, then a pip/venv ROCm install (AMD's TheRock
+    # packaging exposes a "rocm-sdk" helper that reports its own root), then the
+    # system default /opt/rocm. This lets a non-default install (e.g. a Python
+    # virtualenv) be picked up without hand-setting paths.
+    find_program(ROCM_SDK_EXECUTABLE rocm-sdk)
+    set(_rocm_path_default "/opt/rocm")
+    if(DEFINED ENV{ROCM_PATH})
+        set(_rocm_path_default "$ENV{ROCM_PATH}")
+    elseif(ROCM_SDK_EXECUTABLE)
+        execute_process(
+            COMMAND "${ROCM_SDK_EXECUTABLE}" path --root
+            OUTPUT_VARIABLE _rocm_sdk_root
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+            RESULT_VARIABLE _rocm_sdk_root_result)
+        if(_rocm_sdk_root_result EQUAL 0 AND IS_DIRECTORY "${_rocm_sdk_root}")
+            set(_rocm_path_default "${_rocm_sdk_root}")
+        endif()
+    endif()
+    set(ROCM_PATH "${_rocm_path_default}" CACHE PATH "Path to ROCm installation")
+    list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}")
+    find_package(hip REQUIRED)
+    find_package(hiprand REQUIRED)
+    find_package(rocrand REQUIRED)
+    # enable_language(HIP) introduces a separate CMake HIP language with its
+    # own flag namespace (CMAKE_HIP_FLAGS / CMAKE_HIP_ARCHITECTURES). Only
+    # files marked with set_source_files_properties(... LANGUAGE HIP) are
+    # compiled by the HIP toolchain; ordinary C++ files keep using the host
+    # compiler. This is the same pattern PyTorch uses to compile a small
+    # number of HIP translation units inside an otherwise plain C++ build.
+    enable_language(HIP)
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
+        # When the user does not pin the target architectures, try to discover
+        # them from the local ROCm install via "rocm-sdk targets" (TheRock); it
+        # prints the gfx IDs the SDK was built for as a Python-style list, e.g.
+        # ['gfx1100', 'gfx1101']. Extract the gfx tokens regardless of quoting or
+        # separators, and fall back to a portable default set of validated parts.
+        set(_hip_archs "")
+        if(ROCM_SDK_EXECUTABLE)
+            execute_process(
+                COMMAND "${ROCM_SDK_EXECUTABLE}" targets
+                OUTPUT_VARIABLE _rocm_sdk_targets
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+                RESULT_VARIABLE _rocm_sdk_targets_result)
+            if(_rocm_sdk_targets_result EQUAL 0)
+                string(REGEX MATCHALL "gfx[0-9a-fA-F]+" _hip_archs "${_rocm_sdk_targets}")
+            endif()
+        endif()
+        if(NOT _hip_archs)
+            set(_hip_archs "gfx90a;gfx942;gfx1100")
+        endif()
+        set(CMAKE_HIP_ARCHITECTURES "${_hip_archs}" CACHE STRING
+            "AMD GPU architectures to compile HIP code for" FORCE)
+    endif()
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_HIP_ENABLED)
+endif()
+
+if(CGAL_ENABLED)
+    set(CGAL_DO_NOT_WARN_ABOUT_CMAKE_BUILD_TYPE TRUE)
+    # We do not use CGAL data. This prevents an unnecessary warning by CMake.
+    set(CGAL_DATA_DIR "unused")
+    find_package(CGAL ${COLMAP_FIND_TYPE})
+endif()
+
+if(CGAL_FOUND)
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_CGAL_ENABLED)
+    list(APPEND CGAL_LIBRARY ${CGAL_LIBRARIES})
+    message(STATUS "Found CGAL")
+    message(STATUS "  Includes : ${CGAL_INCLUDE_DIRS}")
+    message(STATUS "  Libraries : ${CGAL_LIBRARY}")
+    if(NOT TARGET CGAL)
+        # Older CGAL versions don't come with an imported interface target.
+        add_library(CGAL INTERFACE IMPORTED)
+        target_include_directories(
+            CGAL INTERFACE ${CGAL_INCLUDE_DIRS} ${GMP_INCLUDE_DIR})
+        target_link_libraries(
+            CGAL INTERFACE ${CGAL_LIBRARY} ${GMP_LIBRARIES})
+    endif()
+    list(APPEND COLMAP_LINK_DIRS ${CGAL_LIBRARIES_DIR})
+else()
+    if(CGAL_ENABLED)
+        set(CGAL_ENABLED OFF)
+        message(STATUS "Disabling CGAL support (not found)")
+    else()
+        message(STATUS "Disabling CGAL support")
+    endif()
+endif()
+
+if(DOWNLOAD_ENABLED)
+    # The OpenSSL package in vcpkg seems broken under Windows and leads to
+    # missing certificate verification when connecting to SSL servers. We
+    # therefore use curl[sspi] (i.e., native Windows SSL/TLS) under Windows
+    # and curl[openssl] otherwise.
+    find_package(CURL QUIET)
+    set(CRYPTO_FOUND FALSE)
+    if(IS_MSVC AND IS_ARM64)
+        # OpenSSL crashes for ARM64 under Windows. We therefore fall back to
+        # CryptoPP as an alternative to OpenSSL for SHA256 computation.
+        find_package(CryptoPP QUIET)
+        if(CryptoPP_FOUND)
+            set(CRYPTO_FOUND TRUE)
+        else()
+            message(STATUS "CryptoPP not found")
+        endif()
+    else()
+        find_package(OpenSSL QUIET COMPONENTS Crypto)
+        if(OpenSSL_FOUND)
+            set(CRYPTO_FOUND TRUE)
+        else()
+            message(STATUS "OpenSSL::Crypto not found")
+        endif()
+    endif()
+    if(CURL_FOUND AND CRYPTO_FOUND)
+        message(STATUS "Enabling download support")
+        list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_DOWNLOAD_ENABLED)
+    else()
+        set(DOWNLOAD_ENABLED OFF)
+        message(STATUS "Disabling download support (Curl/Crypto not found)")
+    endif()
+else()
+    message(STATUS "Disabling download support")
+endif()
+
+if(NOT FETCH_POSELIB)
+    find_package(PoseLib ${COLMAP_FIND_TYPE})
+endif()
+
+if(NOT FETCH_FAISS)
+    find_package(faiss ${COLMAP_FIND_TYPE})
+endif()
+
+set(COLMAP_LINK_DIRS ${Boost_LIBRARY_DIRS})
+
+set(CUDA_MIN_VERSION "7.0")
+if(CUDA_ENABLED)
+    if(CMAKE_VERSION VERSION_LESS 3.17)
+        find_package(CUDA QUIET)
+        if(CUDA_FOUND)
+            message(STATUS "Found CUDA version ${CUDA_VERSION} installed in "
+                    "${CUDA_TOOLKIT_ROOT_DIR} via legacy CMake (<3.17) module. "
+                    "Using the legacy CMake module means that any installation of "
+                    "COLMAP will require that the CUDA libraries are "
+                    "available under LD_LIBRARY_PATH.")
+            message(STATUS "Found CUDA ")
+            message(STATUS "  Includes : ${CUDA_INCLUDE_DIRS}")
+            message(STATUS "  Libraries : ${CUDA_LIBRARIES}")
+
+            enable_language(CUDA)
+
+            macro(declare_imported_cuda_target module)
+                add_library(CUDA::${module} INTERFACE IMPORTED)
+                target_include_directories(
+                    CUDA::${module} INTERFACE ${CUDA_INCLUDE_DIRS})
+                target_link_libraries(
+                    CUDA::${module} INTERFACE ${CUDA_${module}_LIBRARY} ${ARGN})
+            endmacro()
+
+            declare_imported_cuda_target(cudart ${CUDA_LIBRARIES})
+            declare_imported_cuda_target(curand ${CUDA_LIBRARIES})
+
+            set(CUDAToolkit_VERSION "${CUDA_VERSION_STRING}")
+            set(CUDAToolkit_BIN_DIR "${CUDA_TOOLKIT_ROOT_DIR}/bin")
+        else()
+            message(STATUS "Disabling CUDA support (not found)")
+        endif()
+    else()
+        find_package(CUDAToolkit QUIET)
+        if(CUDAToolkit_FOUND)
+            set(CUDA_FOUND ON)
+            enable_language(CUDA)
+        else()
+            message(STATUS "Disabling CUDA support (not found)")
+        endif()
+    endif()
+else()
+    message(STATUS "Disabling CUDA support")
+endif()
+
+if(CUDA_ENABLED AND CUDA_FOUND)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "native")
+    endif()
+
+    # Caspar's Symforce-generated kernels use cooperative_groups::labeled_partition
+    # and atomicAdd_block, which require compute capability >= 7.0. Fail early with
+    # a clear message instead of a cryptic nvcc error deep in the kernel build. The
+    # numeric check handles list entries and -real/-virtual suffixes; the special
+    # values native/all/all-major cannot be resolved statically here, so they only
+    # get a warning (nvcc may fall back to an older default arch in build
+    # environments without a visible GPU >= 7.0, e.g. containerized builds).
+    if(CASPAR_ENABLED)
+        foreach(_caspar_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            string(REGEX MATCH "^([0-9]+)" _caspar_arch_num "${_caspar_arch}")
+            if(_caspar_arch_num AND _caspar_arch_num LESS 70)
+                message(FATAL_ERROR
+                    "CASPAR_ENABLED requires CUDA architecture >= 70 (compute "
+                    "capability 7.0), but CMAKE_CUDA_ARCHITECTURES contains "
+                    "'${_caspar_arch}'. Set -DCMAKE_CUDA_ARCHITECTURES to 70+.")
+            endif()
+        endforeach()
+        if(CMAKE_CUDA_ARCHITECTURES MATCHES "native|all|all-major")
+            message(WARNING
+                "CASPAR_ENABLED with CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}': "
+                "Caspar requires compute capability >= 7.0, which cannot be "
+                "verified statically for this value. In an environment without a "
+                "visible GPU >= 7.0 (e.g. containerized builds) nvcc may fall back "
+                "to an older default arch and fail with cryptic kernel errors. "
+                "Set -DCMAKE_CUDA_ARCHITECTURES explicitly (e.g. 75, 86).")
+        endif()
+    endif()
+
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_CUDA_ENABLED)
+
+    # Do not show warnings if the architectures are deprecated.
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets")
+    # Suppress warnings related to Eigen:
+    # Calling a constexpr __host__ function from a __host__ __device__ function is not allowed.
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+    # Explicitly set PIC flags for CUDA targets.
+    if(NOT IS_MSVC)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --compiler-options -fPIC")
+    endif()
+
+    # Handle MSVC runtime library for CUDA to support static CRT linking.
+    # CMake's default CUDA flags use /MD (dynamic), but if the user is building
+    # with static CRT (/MT), we need to override the CUDA flags to match.
+    if(IS_MSVC)
+        # Detect the runtime library from CMAKE_MSVC_RUNTIME_LIBRARY or CXX flags
+        set(_COLMAP_USE_STATIC_RUNTIME OFF)
+
+        if(DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+            if(CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "MultiThreaded" AND
+               NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+                set(_COLMAP_USE_STATIC_RUNTIME ON)
+            endif()
+        elseif(CMAKE_CXX_FLAGS_DEBUG MATCHES "/MTd" OR
+               CMAKE_CXX_FLAGS_RELEASE MATCHES "/MT[^d]" OR
+               CMAKE_CXX_FLAGS MATCHES "/MT")
+            set(_COLMAP_USE_STATIC_RUNTIME ON)
+        endif()
+
+        if(_COLMAP_USE_STATIC_RUNTIME)
+            message(STATUS "CUDA: Using static MSVC runtime library (/MT)")
+            # Replace /MD with /MT in CUDA flags for each build type
+            foreach(_BUILD_TYPE DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+                if(DEFINED CMAKE_CUDA_FLAGS_${_BUILD_TYPE})
+                    string(REPLACE "-MDd" "-MTd" CMAKE_CUDA_FLAGS_${_BUILD_TYPE}
+                           "${CMAKE_CUDA_FLAGS_${_BUILD_TYPE}}")
+                    string(REPLACE "-MD" "-MT" CMAKE_CUDA_FLAGS_${_BUILD_TYPE}
+                           "${CMAKE_CUDA_FLAGS_${_BUILD_TYPE}}")
+                    string(REPLACE "/MDd" "/MTd" CMAKE_CUDA_FLAGS_${_BUILD_TYPE}
+                           "${CMAKE_CUDA_FLAGS_${_BUILD_TYPE}}")
+                    string(REPLACE "/MD" "/MT" CMAKE_CUDA_FLAGS_${_BUILD_TYPE}
+                           "${CMAKE_CUDA_FLAGS_${_BUILD_TYPE}}")
+                endif()
+            endforeach()
+        endif()
+
+        unset(_COLMAP_USE_STATIC_RUNTIME)
+    endif()
+
+    message(STATUS "Enabling CUDA support (version: ${CUDAToolkit_VERSION}, "
+                    "archs: ${CMAKE_CUDA_ARCHITECTURES})")
+else()
+    set(CUDA_ENABLED OFF)
+endif()
+
+if(ONNX_ENABLED)
+    if(FETCH_ONNX)
+        include(FetchContent)
+
+        message(STATUS "Configuring onnxruntime...")
+
+        set(ONNX_VERSION "1.27.1")
+        # ONNX Runtime now ships separate GPU binaries per CUDA major version
+        # (gpu_cuda12 / gpu_cuda13). We consume the CUDA 12 build below, so CUDA
+        # >= 12 is required for the GPU execution provider.
+        if(ONNX_VERSION VERSION_GREATER_EQUAL "1.22"
+           AND CUDA_ENABLED AND CUDA_FOUND AND CUDAToolkit_VERSION VERSION_LESS "12.0")
+            message(WARNING
+                "ONNX Runtime ${ONNX_VERSION} GPU binary is built with CUDA >= 12, "
+                "but CUDA ${CUDAToolkit_VERSION} was detected. The ONNX Runtime CUDA "
+                "execution provider may fail at runtime, CPU execution will continue to work. "
+                "Consider upgrading CUDA to >= 12 or using a source-built onnxruntime.")
+        endif()
+
+        if(IS_MACOS)
+            if(CMAKE_OSX_ARCHITECTURES)
+                set(_COLMAP_MACOS_ARCH ${CMAKE_OSX_ARCHITECTURES})
+            else()
+                set(_COLMAP_MACOS_ARCH ${CMAKE_SYSTEM_PROCESSOR})
+            endif()
+            if(_COLMAP_MACOS_ARCH STREQUAL "x86_64")
+                message(FATAL_ERROR "x86_64 is not supported for onnxruntime")
+            else()
+                FetchContent_Declare(onnxruntime
+                    URL https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-osx-arm64-${ONNX_VERSION}.tgz
+                    URL_HASH SHA256=e42b77a7281cc6e55141bf44fcfbac2c782b823a491bbb6ac33c781dd991f8a6
+                    ${_fetch_content_declare_args}
+                )
+            endif()
+        elseif(IS_LINUX)
+            if(IS_ARM64)
+                FetchContent_Declare(onnxruntime
+                    URL https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-aarch64-${ONNX_VERSION}.tgz
+                    URL_HASH SHA256=33c67e33d1e25b816878366ea276589a024f71f000e7ff955c4b33224d639edd
+                    ${_fetch_content_declare_args}
+                )
+            else()
+                if(CUDA_ENABLED)
+                    FetchContent_Declare(onnxruntime
+                        URL https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-x64-gpu_cuda12-${ONNX_VERSION}.tgz
+                        URL_HASH SHA256=08b568bd69500c36606aff7c3896ee4fa7d3531719f6b00f43e6a34db41dc4bf
+                        ${_fetch_content_declare_args}
+                    )
+                else()
+                    FetchContent_Declare(onnxruntime
+                        URL https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-x64-${ONNX_VERSION}.tgz
+                        URL_HASH SHA256=25b1ef1fea1acd210d63f8f24dc870ad6e077795ce1f54876252c6d3803c15af
+                        ${_fetch_content_declare_args}
+                    )
+                endif()
+            endif()
+        elseif(IS_WINDOWS)
+            FetchContent_Declare(onnxruntime
+                URL https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-win-x64-gpu_cuda12-${ONNX_VERSION}.zip
+                URL_HASH SHA256=78d4de5ab262f79ac5dd59f08ff0d049b1cea605497f375f8df5ba1a52f26111
+                ${_fetch_content_declare_args}
+            )
+        endif()
+
+        FetchContent_MakeAvailable(onnxruntime)
+
+        set(ONNX_INCLUDE_DIR ${onnxruntime_BINARY_DIR}/include/onnxruntime)
+        if(NOT EXISTS ${ONNX_INCLUDE_DIR})
+            file(MAKE_DIRECTORY ${ONNX_INCLUDE_DIR})
+            file(COPY ${onnxruntime_SOURCE_DIR}/include/ DESTINATION ${ONNX_INCLUDE_DIR}/)
+        endif()
+        set(onnxruntime_LIB_DIR ${onnxruntime_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR})
+        if(NOT EXISTS ${onnxruntime_LIB_DIR})
+            file(MAKE_DIRECTORY ${onnxruntime_LIB_DIR})
+            file(COPY ${onnxruntime_SOURCE_DIR}/lib/ DESTINATION ${onnxruntime_LIB_DIR})
+            file(REMOVE_RECURSE ${onnxruntime_LIB_DIR}/cmake)
+            file(REMOVE_RECURSE ${onnxruntime_LIB_DIR}/pkgconfig)
+        endif()
+        if(NOT IS_WINDOWS)
+            set(ONNX_DATA_DIR ${onnxruntime_BINARY_DIR}/share/onnxruntime)
+            if(NOT EXISTS ${ONNX_DATA_DIR})
+                file(MAKE_DIRECTORY ${ONNX_DATA_DIR})
+                file(COPY ${onnxruntime_SOURCE_DIR}/lib/cmake/onnxruntime/ DESTINATION ${ONNX_DATA_DIR}/cmake/)
+                file(REMOVE_RECURSE ${onnxruntime_SOURCE_DIR}/lib/cmake)
+                # The downloaded cmake configs may reference lib64/ (e.g. on Linux x64),
+                # but the actual install directory depends on CMAKE_INSTALL_LIBDIR
+                # (lib/ or lib64/ depending on the distro). Patch the configs to match.
+                if(IS_LINUX AND NOT IS_ARM64)
+                    file(GLOB _onnx_cmake_configs "${ONNX_DATA_DIR}/cmake/*.cmake")
+                    foreach(_config_file ${_onnx_cmake_configs})
+                        file(READ "${_config_file}" _config_content)
+                        string(REPLACE "/lib64/" "/${CMAKE_INSTALL_LIBDIR}/" _config_content "${_config_content}")
+                        file(WRITE "${_config_file}" "${_config_content}")
+                    endforeach()
+                endif()
+            endif()
+            set(onnxruntime_CONFIG_DIR_HINTS ${ONNX_DATA_DIR}/cmake CACHE PATH "ONNX Runtime config directory hints")
+        endif()
+
+        set(onnxruntime_INCLUDE_DIR_HINTS ${onnxruntime_BINARY_DIR}/include CACHE PATH "ONNX Runtime include directory hints")
+        set(onnxruntime_LIBRARY_DIR_HINTS ${onnxruntime_BINARY_DIR}/lib CACHE PATH "ONNX Runtime library directory hints")
+        find_package(onnxruntime ${COLMAP_FIND_TYPE})
+
+        install(DIRECTORY "${onnxruntime_BINARY_DIR}/include/" TYPE INCLUDE)
+        if(IS_WINDOWS)
+            # On Windows, selectively install Libs to lib/. Always install core Libs.
+            # For not supporting TensorRT/ROCM/etc. as a runtime, so not installing it intentionally.
+            install(FILES
+                "${onnxruntime_LIB_DIR}/onnxruntime.lib"
+                "${onnxruntime_LIB_DIR}/onnxruntime_providers_shared.lib"
+                TYPE LIB)
+            # Only install CUDA provider Lib if CUDA is enabled.
+            if(CUDA_ENABLED)
+                install(FILES
+                    "${onnxruntime_LIB_DIR}/onnxruntime_providers_cuda.lib"
+                    TYPE LIB)
+            endif()
+            # On Windows, selectively install DLLs to bin/. Always install core DLLs.
+            # For not supporting TensorRT/ROCM/etc. as a runtime, so not installing it intentionally.
+            install(FILES
+                "${onnxruntime_LIB_DIR}/onnxruntime.dll"
+                "${onnxruntime_LIB_DIR}/onnxruntime_providers_shared.dll"
+                TYPE BIN)
+            # Only install CUDA provider DLL if CUDA is enabled.
+            if(CUDA_ENABLED)
+                install(FILES
+                    "${onnxruntime_LIB_DIR}/onnxruntime_providers_cuda.dll"
+                    TYPE BIN)
+            endif()
+        else()
+            # On Linux/macOS, selectively install library files. Always install core libraries.
+            # Not supporting TensorRT/ROCM/etc. as a runtime, so not installing them.
+            if(IS_MACOS)
+                file(GLOB onnxruntime_CORE_LIBS
+                    "${onnxruntime_LIB_DIR}/libonnxruntime.dylib"
+                    "${onnxruntime_LIB_DIR}/libonnxruntime.*.dylib"
+                    "${onnxruntime_LIB_DIR}/libonnxruntime_providers_shared.dylib")
+                install(FILES ${onnxruntime_CORE_LIBS} TYPE LIB)
+            else()
+                file(GLOB onnxruntime_CORE_LIBS
+                    "${onnxruntime_LIB_DIR}/libonnxruntime.so*"
+                    "${onnxruntime_LIB_DIR}/libonnxruntime_providers_shared.so*")
+                install(FILES ${onnxruntime_CORE_LIBS} TYPE LIB)
+                # Only install CUDA provider if CUDA is enabled.
+                if(CUDA_ENABLED)
+                    file(GLOB onnxruntime_CUDA_LIBS
+                        "${onnxruntime_LIB_DIR}/libonnxruntime_providers_cuda.so*")
+                    install(FILES ${onnxruntime_CUDA_LIBS} TYPE LIB)
+                endif()
+            endif()
+        endif()
+        if(EXISTS "${onnxruntime_BINARY_DIR}/share")
+            install(DIRECTORY "${onnxruntime_BINARY_DIR}/share/" TYPE DATA)
+        endif()
+
+        message(STATUS "Configuring onnxruntime... done")
+    else()
+        find_package(onnxruntime ${COLMAP_FIND_TYPE})
+        if(NOT onnxruntime_FOUND)
+            message(STATUS "Disabling ONNX support (not found)")
+            set(ONNX_ENABLED OFF)
+        endif()
+    endif()
+else()
+    message(STATUS "Disabling ONNX support")
+endif()
+
+if(TARGET onnxruntime::onnxruntime)
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_ONNX_ENABLED)
+    message(STATUS "Enabling ONNX support")
+    # The prebuilt macOS onnxruntime binaries ship with the CoreML execution
+    # provider, which accelerates ONNX inference on the GPU / Apple Neural
+    # Engine. Enable it as the GPU backend on Apple platforms (CUDA is
+    # unavailable there).
+    if(IS_MACOS)
+        list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_COREML_ENABLED)
+        message(STATUS "Enabling ONNX CoreML execution provider")
+    endif()
+endif()
+
+if(GUI_ENABLED)
+    find_package(QT NAMES Qt5 Qt6 REQUIRED)
+    set(COLMAP_QT_COMPONENTS Core OpenGL Svg Widgets)
+    if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
+        list(APPEND COLMAP_QT_COMPONENTS OpenGLWidgets)
+    endif()
+    find_package(Qt${QT_VERSION_MAJOR} ${COLMAP_FIND_TYPE} COMPONENTS ${COLMAP_QT_COMPONENTS})
+    message(STATUS "Found Qt")
+    message(STATUS "  Module : ${Qt${QT_VERSION_MAJOR}Core_DIR}")
+    message(STATUS "  Module : ${Qt${QT_VERSION_MAJOR}OpenGL_DIR}")
+    message(STATUS "  Module : ${Qt${QT_VERSION_MAJOR}Svg_DIR}")
+    message(STATUS "  Module : ${Qt${QT_VERSION_MAJOR}Widgets_DIR}")
+    if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
+        message(STATUS "  Module : ${Qt${QT_VERSION_MAJOR}OpenGLWidgets_DIR}")
+    endif()
+    if(Qt5_FOUND)
+        # Qt5 was built with -reduce-relocations.
+        if(Qt5_POSITION_INDEPENDENT_CODE)
+            set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+            # Workaround for Qt5 CMake config bug under Ubuntu 20.04: https://gitlab.kitware.com/cmake/cmake/-/issues/16915
+            if(TARGET Qt5::Core)
+                get_property(core_options TARGET Qt5::Core PROPERTY INTERFACE_COMPILE_OPTIONS)
+                string(REPLACE "-fPIC" "" new_qt5_core_options "${core_options}")
+                set_property(TARGET Qt5::Core PROPERTY INTERFACE_COMPILE_OPTIONS ${new_qt5_core_options})
+                set_property(TARGET Qt5::Core PROPERTY INTERFACE_POSITION_INDEPENDENT_CODE "ON")
+                if(NOT IS_MSVC)
+                    set(CMAKE_CXX_COMPILE_OPTIONS_PIE "-fPIC")
+                endif()
+            endif()
+        endif()
+    endif()
+
+    if(QT_FOUND)
+        # Enable automatic compilation of Qt resource files.
+        set(CMAKE_AUTORCC ON)
+    endif()
+endif()
+
+if(GUI_ENABLED AND Qt${QT_VERSION_MAJOR}_FOUND)
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_GUI_ENABLED)
+    message(STATUS "Enabling GUI support")
+else()
+    set(GUI_ENABLED OFF)
+    message(STATUS "Disabling GUI support")
+endif()
+
+if(MVS_ENABLED)
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_MVS_ENABLED)
+    message(STATUS "Enabling MVS support")
+else()
+    message(STATUS "Disabling MVS support")
+endif()
+
+if(OPENGL_ENABLED)
+    if(NOT GUI_ENABLED)
+        message(STATUS "Disabling GUI also disables OpenGL")
+        set(OPENGL_ENABLED OFF)
+    else()
+        message(STATUS "Enabling OpenGL support")
+    endif()
+else()
+    message(STATUS "Disabling OpenGL support")
+endif()
+
+set(GPU_ENABLED OFF)
+if(OPENGL_ENABLED OR CUDA_ENABLED)
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_GPU_ENABLED)
+    message(STATUS "Enabling GPU support (OpenGL: ${OPENGL_ENABLED}, CUDA: ${CUDA_ENABLED})")
+    set(GPU_ENABLED ON)
+endif()
